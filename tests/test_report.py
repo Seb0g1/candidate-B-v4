@@ -5,7 +5,7 @@ import io
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from decimal import Decimal as D
 
@@ -428,14 +428,10 @@ class TCli(unittest.TestCase):
         self.assertEqual(d1["не распределено (аванс)"], "15000,00")
 
     def test_bad_date(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf), self.assertRaises(SystemExit):
-            from contextlib import redirect_stderr
-            with redirect_stderr(io.StringIO()):
-                report.main(["--date", "10.11.2026"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            report.main(["--date", "10.11.2026"])
 
     def test_missing_data_dir(self):
-        from contextlib import redirect_stderr
         err = io.StringIO()
         with redirect_stderr(err):
             code = report.main(["--date", "2026-11-10", "--data", os.path.join(ROOT, "nope")])
@@ -457,7 +453,8 @@ class TReviewFixes(unittest.TestCase):
         self.assertEqual([w.work_id for w in rep.works], ["W1"])
         c = c_line(rep)
         self.assertEqual((c.allocated, c.unallocated), (D("10.00"), D("0.00")))
-        self.assertEqual(len(kinds(rep, "error")), 2)
+        # цена W2, сумма C2 и предупреждение, что сумма работ по C неполная
+        self.assertEqual(len(kinds(rep, "error")), 3)
 
     def test_zero_price_allowed(self):
         rep = build([contract(amount="0.00")], [work("W1", price="0.00")], [])
@@ -586,7 +583,6 @@ class TReviewFixes2(unittest.TestCase):
         self.assertEqual(report.parse_money("100"), D("100.00"))
 
     def test_bad_cli_date_format_rejected(self):
-        from contextlib import redirect_stderr
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             report.main(["--date", "20261110", "--data", DATA])
 
@@ -597,11 +593,65 @@ class TReviewFixes2(unittest.TestCase):
         self.assertEqual(len(kinds(rep, "error")), 1)
 
     def test_out_to_missing_dir_returns_2(self):
-        from contextlib import redirect_stderr
         with redirect_stderr(io.StringIO()):
             code = report.main(["--date", "2026-11-10", "--data", DATA, "--format", "csv",
                                 "--out", os.path.join(ROOT, "nope", "r.csv")])
         self.assertEqual(code, 2)
+
+
+
+class TReviewFixes3(unittest.TestCase):
+    """Регрессии по третьему code review."""
+
+    def test_same_id_in_hidden_contract_does_not_drop_visible_rows(self):
+        rep = build([contract(amount="50.00"), contract("C2", signed="2026-12-01")],
+                    [work("W1", cid="C2"), work("W1", status="done", completed="2026-03-01")],
+                    [pay("P1", "10.00", cid="C2"), pay("P1", "30.00")])
+        self.assertEqual(w_line(rep, "W1").contract_id, "C")
+        c = c_line(rep)
+        self.assertEqual((c.works_total, c.paid_net, w_line(rep, "W1").paid), (D("50.00"), D("30.00"), D("30.00")))
+        self.assertEqual(rep.attention, [])
+
+    def test_huge_totals_do_not_crash(self):
+        self.assertRaises(ValueError, report.parse_money, "99999999999999999999999999.99")
+        big = "1000000000000.00"
+        rep = build([contract(amount=big)], [work("W1", price=big), work("W2", price=big)],
+                    [pay("P1", big), pay("P2", big)])
+        self.assertEqual(c_line(rep).works_total, D("2000000000000.00"))
+        self.assertIn("2 000 000 000 000,00", report.render_table(rep))
+
+    def test_accepted_then_cancelled_after_date_is_done_on_date(self):
+        rep = build([contract(amount="50.00")],
+                    [work("W1", status="cancelled", completed="2026-02-01", cancelled="2026-12-01")],
+                    [pay("P1", "50.00")])
+        w = w_line(rep, "W1")
+        self.assertEqual((w.status, w.paid, c_line(rep).unallocated), ("done", D("50.00"), D("0.00")))
+
+    def test_bad_amount_contract_signed_later_is_silent(self):
+        rep = build([contract(amount="50.00"), contract("C2", amount="abc", signed="2026-12-01")],
+                    [work("W1"), work("W2", cid="C2")], [pay("P1", "1.00", cid="C2")])
+        self.assertEqual(rep.attention, [])
+
+    def test_bad_price_is_not_overpayment(self):
+        rep = build([contract(amount="50.00")], [work("W1", price="abc")],
+                    [pay("P1", "50.00", wid="W1", purpose="W1")])
+        self.assertEqual(kinds(rep, "overpayment"), [])
+        self.assertEqual(kinds(rep, "discrepancy"), [])
+        self.assertNotIn("не найдена", texts(rep))
+        self.assertEqual(len(kinds(rep, "error")), 2)   # цена W1 + сумма работ по договору неполная
+        self.assertEqual(c_line(rep).unallocated, D("50.00"))
+
+    def test_malformed_acceptance_date_single_error(self):
+        rep = build([contract(amount="50.00")], [work("W1", status="done", completed="2026/10/01")], [])
+        errs = kinds(rep, "error")
+        self.assertEqual(len(errs), 1)
+        self.assertIn("2026/10/01", errs[0].text)
+
+    def test_queued_with_only_paid_at_single_error(self):
+        p = pay("P1", "10.00", status="queued")
+        p["created_at"], p["paid_at"] = "", "2026-02-01"
+        rep = build([contract(amount="50.00")], [work("W1")], [p])
+        self.assertEqual(len(kinds(rep, "error")), 1)
 
 
 if __name__ == "__main__":

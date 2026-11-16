@@ -15,7 +15,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal
 
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
@@ -35,6 +35,9 @@ KIND_RU = {
 
 MONEY_RE = re.compile(r"-?[0-9]+(\.[0-9]+)?")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# Потолок одной суммы: триллион рублей. Итоги из миллионов таких строк остаются в 28 знаках
+# точности Decimal, поэтому сложение и вывод точные и не падают.
+MAX_MONEY = Decimal("1000000000000")
 
 
 def parse_money(text: str) -> Decimal:
@@ -42,10 +45,9 @@ def parse_money(text: str) -> Decimal:
     if not isinstance(text, str) or not MONEY_RE.fullmatch(text.strip()):
         raise ValueError(f"не сумма: {text!r}")
     value = Decimal(text.strip())
-    try:
-        return value.quantize(CENT, rounding=ROUND_HALF_UP)
-    except InvalidOperation:  # слишком большое число для копеек
-        raise ValueError(f"не сумма: {text!r}") from None
+    if abs(value) > MAX_MONEY:
+        raise ValueError(f"слишком большая сумма: {text!r}")
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def parse_date(text: str) -> date | None:
@@ -56,6 +58,14 @@ def parse_date(text: str) -> date | None:
     if not DATE_RE.fullmatch(text):
         raise ValueError(f"не дата ГГГГ-ММ-ДД: {text!r}")
     return date.fromisoformat(text)
+
+
+def quiet_date(text: str) -> date | None:
+    """Как parse_date, но нераспознанная дата → None без ошибки (её отметит тот, кто ею пользуется)."""
+    try:
+        return parse_date(text)
+    except ValueError:
+        return None
 
 
 def cli_date(text: str) -> date:
@@ -186,48 +196,52 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
             return None
         return value
 
-    # --- договоры
+    # --- договоры. Ошибки копим по договору и показываем только для видимых на дату (п. 12)
     all_contracts: dict[str, dict] = {}
-    bad_amount: dict[str, Issue] = {}   # договор с ошибкой в сумме → его первая ошибка
+    first_signed: dict[str, date | None] = {}   # дата подписания из первой строки договора
+    contract_errors: dict[str, list[Issue]] = {}
     for row in contracts:
         cid = row["contract_id"]
+        start = len(issues)
         if cid in all_contracts:
-            if is_visible(all_contracts[cid]["signed"], R):
-                err(cid, f"договор {cid} повторяется в contracts.csv — взята первая корректная строка")
-            continue
-        amount = money_or_none(row, "amount", f"договор {cid}", cid, positive=False)
-        if amount is None:
-            bad_amount.setdefault(cid, issues[-1])
-            continue
-        all_contracts[cid] = {"row": row, "amount": amount, "signed": safe_date(row, "signed_at", cid, cid)}
-    bad_contracts = set(bad_amount) - set(all_contracts)   # их работы и платежи молча пропускаем
-    for cid in bad_contracts:
-        bad_amount[cid].text += "; работы и платежи по договору тоже не учтены"
+            err(cid, f"договор {cid} повторяется в contracts.csv — взята первая корректная строка")
+        else:
+            first_signed.setdefault(cid, quiet_date(row.get("signed_at", "")))
+            amount = money_or_none(row, "amount", f"договор {cid}", cid, positive=False)
+            if amount is not None:
+                all_contracts[cid] = {"row": row, "amount": amount,
+                                      "signed": safe_date(row, "signed_at", cid, cid)}
+        contract_errors.setdefault(cid, []).extend(issues[start:])
+        del issues[start:]
 
     lines: dict[str, ContractLine] = {}
-    for cid, c in all_contracts.items():
-        if is_visible(c["signed"], R):   # п. 12
+    for cid in contract_errors:
+        c = all_contracts.get(cid)
+        if not is_visible(c["signed"] if c else first_signed[cid], R):
+            continue
+        errors = contract_errors[cid]
+        if c:
             lines[cid] = ContractLine(cid, c["row"]["contractor"], c["amount"])
+        elif errors:   # их работы и платежи молча пропускаем
+            errors[0].text += "; работы и платежи по договору тоже не учтены"
+        issues.extend(errors)
 
-    def hidden(cid: str) -> bool:
-        return cid in all_contracts and cid not in lines
+    # строки договоров, которых на дату нет или которые не разобрались, дальше не участвуют
+    works = [r for r in works if r["contract_id"] in lines or r["contract_id"] not in contract_errors]
+    payments = [r for r in payments if r["contract_id"] in lines or r["contract_id"] not in contract_errors]
 
     def contract_usable(cid: str, what: str) -> bool:
-        """Договор есть и виден на дату. Ошибки по скрытым договорам не показываем (п. 12)."""
         if cid in lines:
             return True
-        if cid not in all_contracts and cid not in bad_contracts:
-            err(cid, f"{what}: договор {cid or '(пусто)'} не найден — строка не учтена")
+        err(cid, f"{what}: договор {cid or '(пусто)'} не найден — строка не учтена")
         return False
 
     # --- работы
     work_lines: dict[str, WorkLine] = {}
-    work_contract: dict[str, str] = {}   # все корректные работы, включая скрытые договоры
+    work_contract: dict[str, str] = {}   # корректные работы
+    unpriced: dict[str, str] = {}        # работы с нераспознанной ценой → договор (п. 11)
     for row in works:
         wid, cid = row["work_id"], row["contract_id"]
-        if hidden(cid) or hidden(work_contract.get(wid, "")):
-            work_contract.setdefault(wid, cid)
-            continue
         if wid in work_contract:
             err(cid, f"работа {wid} повторяется в works.csv — взята первая корректная строка")
             continue
@@ -235,11 +249,16 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
             continue
         price = money_or_none(row, "price", f"работа {wid}", cid, positive=False)
         if price is None:
+            unpriced.setdefault(wid, cid)
             continue
+        unpriced.pop(wid, None)
         work_contract[wid] = cid
-        completed = safe_date(row, "completed_at", wid, cid)
-        cancelled = safe_date(row, "cancelled_at", wid, cid)
-        status_at = work_status_at(row["status"], completed, cancelled, wid, cid, R, err)
+        # дату, от которой зависит статус, проверяет work_status_at — одна ошибка на одно поле
+        completed = (quiet_date(row["completed_at"]) if row["status"] == "done"
+                     else safe_date(row, "completed_at", wid, cid))
+        cancelled = (quiet_date(row["cancelled_at"]) if row["status"] == "cancelled"
+                     else safe_date(row, "cancelled_at", wid, cid))
+        status_at = work_status_at(row, completed, cancelled, cid, R, err)
         final = {"done": (completed, "принята"), "cancelled": (cancelled, "отменена")}.get(row["status"])
         if final and final[0] and final[0] > R:
             issues.append(Issue("after_date", cid, f"{wid} «{row['title']}» {final[1]} {fmt_date(final[0])} — "
@@ -253,9 +272,6 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
     seen_payments: dict[str, str] = {}   # payment_id → договор
     for row in payments:
         pid, cid, wid = row["payment_id"], row["contract_id"], row.get("work_id", "")
-        if hidden(cid) or hidden(seen_payments.get(pid, "")):
-            seen_payments.setdefault(pid, cid)
-            continue
         if pid in seen_payments:
             err(cid, f"платёж {pid} повторяется в payments.csv — взята первая корректная строка")
             continue
@@ -286,7 +302,9 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
         is_refunded = is_paid and refund_date is not None and refund_date <= R
 
         # привязка к работе (п. 6–7, 11) — проверяем и платежи в очереди, пока их можно поправить
-        if wid and work_contract.get(wid) != cid:
+        if wid and unpriced.get(wid) == cid:
+            wid = ""   # ошибка цены уже показана, деньги идут в общий пул договора
+        elif wid and work_contract.get(wid) != cid:
             where = f"относится к договору {work_contract[wid]}" if wid in work_contract else "не найдена"
             err(cid, f"платёж {pid}: работа {wid} {where} — платёж считаю непривязанным к работе")
             wid = ""
@@ -348,9 +366,15 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
         line.allocated = sum((w.paid for w in own), ZERO)
         line.unallocated = line.paid_net - line.allocated
         line.remaining = max(line.works_total - line.paid_net, ZERO)   # п. 10
-        line.overpaid = max(line.paid_net - line.works_total, ZERO)    # п. 9
+        no_price = sorted(wid for wid, c in unpriced.items() if c == cid)
+        if not no_price:
+            line.overpaid = max(line.paid_net - line.works_total, ZERO)   # п. 9
 
-        if line.amount != line.works_total:                            # п. 5
+        if no_price:   # сумма работ неполная: сравнивать её с договором и выплатами нельзя
+            err(cid, f"{cid}: у работ {', '.join(no_price)} цена с ошибкой (см. выше) — сумма работ и «осталось» "
+                     f"по договору неполные, переплату и расхождение с договором не проверяю; "
+                     f"платежи на эти работы учтены как непривязанные")
+        elif line.amount != line.works_total:                          # п. 5
             cancelled = sum((w.price for w in own if w.status == "cancelled"), ZERO)
             extra = f" (отменено работ на {fmt_money(cancelled)} ₽)" if cancelled else ""
             question = ("договор уменьшен (допсоглашение) или будет ещё работа?"
@@ -359,11 +383,11 @@ def build_report(contracts: list[dict], works: list[dict], payments: list[dict],
             issues.append(Issue("discrepancy", cid, f"{cid}: сумма договора {fmt_money(line.amount)} ₽, а действующих "
                                                     f"работ {fmt_money(line.works_total)} ₽{extra}. «Осталось» "
                                                     f"считаю от суммы работ. Подтвердить: {question}"))
-        if line.overpaid:
+        if line.overpaid and not no_price:
             issues.append(Issue("overpayment", cid, f"{cid}: выплачено {fmt_money(line.paid_net)} ₽ при сумме работ "
                                                     f"{fmt_money(line.works_total)} ₽ — переплата "
                                                     f"{fmt_money(line.overpaid)} ₽"))
-        if line.queued and line.paid_net + line.queued > line.works_total:
+        if not no_price and line.queued and line.paid_net + line.queued > line.works_total:
             over = line.paid_net + line.queued - line.works_total
             issues.append(Issue("overpayment", cid, f"{cid}: если оплатить очередь ({fmt_money(line.queued)} ₽), "
                                                     f"будет переплата {fmt_money(over)} ₽ — проверить до оплаты"))
@@ -387,18 +411,28 @@ def purpose_mentions_work(purpose: str, work_id: str, title: str) -> bool:
     return bool(title) and re.search(rf"(?<!\w){re.escape(title)}(?!\w)", text) is not None
 
 
-def work_status_at(status, completed, cancelled, wid, cid, R, err) -> str:
-    """Статус работы на дату (п. 3, 11)."""
+def missing_date(row: dict, col: str) -> str:
+    raw = row.get(col, "")
+    return f"дата {col} «{raw}» не в формате ГГГГ-ММ-ДД" if raw else f"нет даты {col}"
+
+
+def work_status_at(row, completed, cancelled, cid, R, err) -> str:
+    """Статус работы на дату (п. 3, 11). Дату своего статуса проверяет здесь, а не в safe_date."""
+    status, wid = row["status"], row["work_id"]
     if status == "done":
         if completed is None:
-            err(cid, f"работа {wid}: статус done без даты приёмки — считаю принятой на любую дату")
+            err(cid, f"работа {wid}: статус done, {missing_date(row, 'completed_at')} — считаю принятой на любую дату")
             return "done"
         return "done" if completed <= R else "planned"
     if status == "cancelled":
         if cancelled is None:
-            err(cid, f"работа {wid}: статус cancelled без даты отмены — считаю отменённой на любую дату")
+            err(cid, f"работа {wid}: статус cancelled, {missing_date(row, 'cancelled_at')} — "
+                     f"считаю отменённой на любую дату")
             return "cancelled"
-        return "cancelled" if cancelled <= R else "planned"
+        if cancelled <= R:
+            return "cancelled"
+        # отменена после даты отчёта: на дату была принята, если приёмка была раньше
+        return "done" if completed and completed <= R else "planned"
     if status != "planned":
         err(cid, f"работа {wid}: неизвестный статус «{status}» — считаю запланированной")
     elif completed or cancelled:
@@ -416,13 +450,15 @@ def payment_state_at(row, pid, cid, R, err, safe_date, signed):
         err(cid, f"платёж {pid}: неизвестный статус «{status}» — платёж не учтён")
         return None
     if status == "queued":
-        if paid or refunded:
+        paid = refunded = None   # верю статусу; лишние даты отмечаю ниже, если платёж учтён
+    if paid is None and created is None:
+        what = "заведения (статус queued)" if status == "queued" else "ни заведения, ни оплаты"
+        err(cid, f"платёж {pid}: нет корректной даты {what} — платёж не учтён")
+        return None
+    if status == "queued":
+        if row.get("paid_at") or row.get("refunded_at"):
             err(cid, f"платёж {pid}: статус queued, но заполнена дата оплаты/возврата — верю статусу")
-        paid = refunded = None
     else:
-        if paid is None and created is None:
-            err(cid, f"платёж {pid}: нет ни даты заведения, ни даты оплаты — платёж не учтён")
-            return None
         if paid is None:
             paid = created
             err(cid, f"платёж {pid}: статус {status} без даты оплаты — беру дату заведения {fmt_date(created)}")
@@ -439,11 +475,7 @@ def payment_state_at(row, pid, cid, R, err, safe_date, signed):
             refunded = None
     if created and paid and paid < created:
         err(cid, f"платёж {pid}: оплачен {fmt_date(paid)} раньше, чем заведён {fmt_date(created)}")
-    known = [d for d in (created, paid) if d]
-    if not known:
-        err(cid, f"платёж {pid}: нет ни даты заведения, ни даты оплаты — платёж не учтён")
-        return None
-    start = min(known)
+    start = min(d for d in (created, paid) if d)
     if signed and start < signed:
         err(cid, f"платёж {pid} от {fmt_date(start)} раньше подписания договора {fmt_date(signed)}")
     return start <= R, created, paid, refunded
